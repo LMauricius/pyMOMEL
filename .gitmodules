@@ -1,0 +1,3 @@
+[submodule "MOMEL-spec"]
+	path = MOMEL-spec
+	url = https://github.com/LMauricius/MOMEL-spec
