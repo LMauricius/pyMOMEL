@@ -43,6 +43,7 @@ class ParseError(Exception):
 
 # Single-character escape letter -> decoded character.
 _ESCAPE_MAP: dict[str, str] = {
+    "\n": "",
     "n": "\n",
     "_": " ",
     ":": ":",
@@ -67,6 +68,8 @@ _ESCAPE_MAP: dict[str, str] = {
 
 # Characters that start/delimit special MOMEL values.
 _STRUCTURAL = set("()[]{}\"' \t\n")
+
+_WHITESPACE = " \t"
 
 
 def decode_escape(src: str, pos: int, line: int, col: int) -> tuple[str, int]:
@@ -155,6 +158,21 @@ class _Parser:
             self.line_start = self.pos
         return ch
 
+    def advance_escape(self) -> str:
+        """Consume an escape sequence; update line tracking."""
+        decoded, new_pos = decode_escape(
+            self.src, self.pos, self.line, self.current_col()
+        )
+
+        for cur_pos in range(self.pos, new_pos):
+            ch = self.src[cur_pos]
+            if ch == "\n":
+                self.line += 1
+                self.line_start = cur_pos
+
+        self.pos = new_pos
+        return decoded
+
     def current_col(self) -> int:
         """0-based column of the current position."""
         return self.pos - self.line_start
@@ -171,7 +189,11 @@ class _Parser:
 
     def skip_ws_inline(self) -> None:
         """Skip spaces and tabs on the current line only."""
-        while self.peek() in (" ", "\t"):
+        while self.peek() in _WHITESPACE or (
+            self.peek() == "\\" and self.peek(1) == "\n"
+        ):
+            if self.peek() == "\\":
+                self.advance()
             self.advance()
 
     def skip_comment(self) -> None:
@@ -183,11 +205,6 @@ class _Parser:
     def skip_blank_lines(self) -> None:
         """Skip lines that are entirely whitespace or comments."""
         while True:
-            # Save position in case this line isn't blank.
-            saved_pos = self.pos
-            saved_line = self.line
-            saved_ls = self.line_start
-
             self.skip_ws_inline()
             self.skip_comment()
 
@@ -196,16 +213,7 @@ class _Parser:
             elif self.peek() == "":
                 break  # EOF is fine
             else:
-                # Non-blank line: restore and stop.
-                self.pos = saved_pos
-                self.line = saved_line
-                self.line_start = saved_ls
                 break
-
-    def at_eol(self) -> bool:
-        """True if current position is at end of logical line (newline, EOF, #, ], })."""
-        ch = self.peek()
-        return ch in ("\n", "", "#", "]", "}")
 
     # ------------------------------------------------------------------
     # Top-level / dict
@@ -233,34 +241,17 @@ class _Parser:
             ch = self.peek()
 
             # End of dict body.
+            if ch == "" and closing is not None:
+                raise self.error(f"unexpected EOF, expected {closing!r}")
             if closing is not None and ch == closing:
                 self.advance()
                 return result
 
-            # EOF while parsing top-level dict is fine.
-            if ch == "":
-                if closing is not None:
-                    raise self.error(f"unexpected EOF, expected {closing!r}")
-                return result
-
             # Parse one field.
             key = self._parse_identifier()
-            self.skip_ws_inline()
             self.expect(":")
             self.skip_ws_inline()
             val = self._parse_tuple()
-
-            # Expect end of line (or '}' immediately closing the dict).
-            self.skip_ws_inline()
-            self.skip_comment()
-            if self.peek() not in ("\n", "", "}" if closing == "}" else "\n"):
-                # Allow closing brace to follow on same line as last field.
-                if closing == "}" and self.peek() == "}":
-                    pass
-                else:
-                    raise self.error(f"expected end of line, got {self.peek()!r}")
-            if self.peek() == "\n":
-                self.advance()
 
             # Duplicate key handling: merge if both sides are (dict,).
             if key in result:
@@ -277,8 +268,9 @@ class _Parser:
             else:
                 result[key] = val
 
-        # Unreachable but satisfies type checkers.
-        return result  # pragma: no cover
+            # Expect end of line, EOF, or closing brace.
+            if ch != "\n" and ch != "":
+                raise self.error(f"expected end of line, got {ch!r}")
 
     def _parse_identifier(self) -> str:
         """
@@ -287,6 +279,7 @@ class _Parser:
         \\_ escape -> literal space (preserved, not stripped).
         """
         parts: list[str] = []
+        numTrailingWS = 0
 
         while True:
             ch = self.peek()
@@ -298,47 +291,26 @@ class _Parser:
                 break
 
             if ch == "\\":
-                # Line continuation inside identifier: treat like tuple continuation.
-                if self.peek(1) == "\n":
-                    self.advance()  # consume '\'
-                    self.advance()  # consume '\n'
-                    continue
-
                 self.advance()  # consume '\'
-                decoded, new_pos = decode_escape(
-                    self.src, self.pos, self.line, self.current_col()
-                )
-                # \_ is a non-strippable space — mark it so stripping won't remove it.
-                # We encode it as a special sentinel during accumulation; see below.
-                if self.src[self.pos - 1 : self.pos] == "" and decoded == " ":
-                    # Actually we already consumed '\', pos now points to '_'
-                    pass
-                # Check if the escape was \_  (literal space that should not be trimmed).
-                # We handle this by looking at what escape char was.
-                esc_char = self.src[self.pos] if self.pos < len(self.src) else ""
-                self.pos = new_pos
-                if esc_char == "_":
-                    # Non-strippable space: use a private sentinel.
-                    parts.append("\x00NBSP\x00")
-                else:
-                    parts.append(decoded)
-                continue
-
-            if is_identifier_char(ch):
-                parts.append(ch)
-                self.advance()
+                parts.append(self.advance_escape())
+                numTrailingWS = 0
             else:
-                # Structural char that's not ':' or newline.
                 parts.append(ch)
                 self.advance()
+
+                if ch in _WHITESPACE:
+                    numTrailingWS += 1
+                else:
+                    numTrailingWS = 0
 
         raw = "".join(parts)
 
-        # Strip ordinary leading/trailing whitespace (spaces and tabs), but
-        # restore \_ sentinels to actual spaces.
-        stripped = raw.strip(" \t")
-        result = stripped.replace("\x00NBSP\x00", " ")
-        return result
+        # Strip ordinary trailing whitespace (spaces and tabs)
+        if numTrailingWS > 0:
+            stripped = raw[0:-numTrailingWS]
+        else:
+            stripped = raw
+        return stripped
 
     # ------------------------------------------------------------------
     # List
@@ -353,7 +325,6 @@ class _Parser:
 
         while True:
             self.skip_blank_lines()
-            self.skip_ws_inline()
 
             if self.peek() == "]":
                 self.advance()
@@ -367,16 +338,10 @@ class _Parser:
 
             self.skip_ws_inline()
             self.skip_comment()
-            if self.peek() == "\n":
-                self.advance()
-            elif self.peek() == "]":
-                pass  # closing bracket follows immediately
-            elif self.peek() == "":
+            if self.peek() == "":
                 raise self.error("unexpected EOF inside list")
-            else:
+            elif self.peek() != "\n":
                 raise self.error(f"expected newline or ']', got {self.peek()!r}")
-
-        return items  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Tuple
@@ -394,27 +359,8 @@ class _Parser:
             ch = self.peek()
 
             # End of logical line.
-            if ch in ("\n", "", "]", "}"):
+            if ch in ("\n", "#", "", "]", "}"):
                 break
-
-            # Comment → end of tuple.
-            if ch == "#":
-                self.skip_comment()
-                break
-
-            # Line continuation: '\' followed immediately by '\n'.
-            if ch == "\\":
-                next_ch = self.peek(1)
-                if next_ch == "\n":
-                    self.advance()  # consume '\'
-                    self.advance()  # consume '\n'
-                    # Skip any leading whitespace on the continuation line.
-                    self.skip_ws_inline()
-                    continue
-                # Not a continuation - fall through to parse_value
-                # (backslash starts an escape in a simple string or identifier context,
-                #  but a bare '\' at the value-start position is unusual;
-                #  parse_value will handle it via simple-string path).
 
             values.append(self._parse_value())
 
@@ -451,12 +397,8 @@ class _Parser:
         if ch in ("+", "-") and self.peek(1).isdigit():
             return self._parse_number()
 
-        # Hex/binary/octal prefix: 0x, 0b, 0o.
-        if ch == "0" and self.peek(1) in ("x", "b", "o"):
-            return self._parse_number()
-
         # Simple string / keyword.
-        if is_suffix_char(ch) or ch == "\\":
+        if ch not in _STRUCTURAL and ch != "":
             return self._parse_simple_string()
 
         raise self.error(f"unexpected character {ch!r} in value position")
@@ -471,66 +413,73 @@ class _Parser:
         significand digits (with _ separators and optional decimal point),
         optional scientific exponent (_+N or _-N), optional unit suffix.
         """
+
+        sig_parts: list[str] = []
+        has_dot = False
+        decimals = 0
+        exponent_str = ""
+
         # 1. Optional sign.
-        sign = 1
-        if self.peek() in ("+", "-"):
-            sign = -1 if self.advance() == "-" else 1
+        if self.peek() in "+-":
+            sig_parts.append(self.advance())
 
         # 2. Base prefix.
         base = 10
-        base_digits: set[str]
-        if self.peek() == "0" and self.peek(1) in ("x", "X"):
-            self.advance()
-            self.advance()
-            base = 16
-            base_digits = set("0123456789abcdefABCDEF")
-        elif self.peek() == "0" and self.peek(1) in ("b", "B"):
-            self.advance()
-            self.advance()
-            base = 2
-            base_digits = set("01")
-        elif self.peek() == "0" and self.peek(1) in ("o", "O"):
-            self.advance()
-            self.advance()
-            base = 8
-            base_digits = set("01234567")
+        base_digits: str
+        if self.peek() == "0":
+            if self.peek(1) in "xX":
+                self.advance()
+                self.advance()
+                base = 16
+                base_digits = "0123456789abcdefABCDEF"
+            elif self.peek(1) in ("b", "B"):
+                self.advance()
+                self.advance()
+                base = 2
+                base_digits = "01"
+            elif self.peek(1) in ("o", "O"):
+                self.advance()
+                self.advance()
+                base = 8
+                base_digits = "01234567"
+            else:
+                base_digits = "0123456789"
         else:
-            base_digits = set("0123456789")
+            base_digits = "0123456789"
 
         # 3. Consume significand digits.
         #    State: we may or may not encounter a decimal point (decimal only)
         #    and we stop when we hit the exponent marker (_+/_-) or a suffix char.
-        sig_parts: list[str] = []
-        has_dot = False
-        exponent_sign = 1
-        exponent_digits = ""
-        has_exponent = False
 
         while True:
             ch = self.peek()
 
             if ch in base_digits:
+                if has_dot:
+                    decimals += 1
+
                 sig_parts.append(ch)
                 self.advance()
-
             elif ch == "_":
                 # Peek at what follows the underscore.
                 nxt = self.peek(1)
-                if nxt in ("+", "-"):
+                if nxt in "+-":
                     # Scientific notation exponent marker.
                     self.advance()  # consume '_'
-                    exp_sign_ch = self.advance()  # consume '+' or '-'
-                    exponent_sign = -1 if exp_sign_ch == "-" else 1
+
+                    exponent_str += self.advance()  # consume '+' or '-'
+
                     # Exponent digits are always decimal.
-                    exp_str_parts: list[str] = []
+                    exponent_digits = ""
                     while self.peek().isdigit() or self.peek() == "_":
                         c = self.advance()
                         if c != "_":
-                            exp_str_parts.append(c)
-                    exponent_digits = "".join(exp_str_parts)
+                            exponent_digits += c
+
                     if not exponent_digits:
                         raise self.error("expected digits after exponent marker")
-                    has_exponent = True
+
+                    exponent_str += exponent_digits
                     break  # suffix may follow
                 elif nxt in base_digits:
                     # Digit separator - skip the underscore.
@@ -538,66 +487,58 @@ class _Parser:
                 else:
                     # Underscore not followed by digit or sign -> start of suffix.
                     break
-
-            elif ch == "." and base == 10 and not has_dot:
-                # Decimal point - only in decimal mode, only once.
+            elif ch == "." and not has_dot:
+                # Decimal point, only once.
                 has_dot = True
-                sig_parts.append(ch)
                 self.advance()
-
             else:
                 # Anything else ends the digit portion.
                 break
 
         # 4. Build numeric value from significand.
-        sig_str = "".join(sig_parts).replace("_", "")
+        numeric_val: int | float
+
+        sig_str = "".join(sig_parts)
         if not sig_str:
             raise self.error("expected digits in number")
 
-        if has_dot or (has_exponent and exponent_sign < 0):
+        if has_dot or (exponent_str != "" and exponent_str[0] == "-"):
             # Float path.
-            try:
-                if base == 10:
-                    numeric_val: int | float = float(sig_str)
+            if base == 10:
+                if decimals > 0:
+                    py_num_str = f"{sig_str[0:-decimals]}.{sig_str[-decimals:]}"
                 else:
-                    # Non-decimal float: parse integer part then convert.
-                    numeric_val = float(int(sig_str, base))
-            except ValueError:
-                raise self.error(f"invalid number significand: {sig_str!r}")
+                    py_num_str = sig_str
+
+                if exponent_str != "":
+                    py_num_str += f"e{exponent_str}"
+
+                try:
+                    numeric_val = float(py_num_str)
+                except ValueError:
+                    raise self.error(f"invalid number: {py_num_str!r}")
+            else:
+                try:
+                    significand_val = int(sig_str, base)
+                except ValueError:
+                    raise self.error(f"invalid number significand: {sig_str!r}")
+
+                try:
+                    exponent_val = int(exponent_str, 10)
+                except ValueError:
+                    raise self.error(f"invalid number exponent: {exponent_str!r}")
+
+                power_val = exponent_val - decimals
+
+                if power_val >= 0:
+                    numeric_val = significand_val * (base**power_val)
+                else:
+                    numeric_val = significand_val / (base**power_val)
         else:
             try:
                 numeric_val = int(sig_str, base)
             except ValueError:
-                raise self.error(f"invalid number significand: {sig_str!r}")
-
-        # 5. Apply sign.
-        numeric_val = sign * numeric_val
-
-        # 6. Apply exponent: value *= base ** (sign * exp).
-        if has_exponent:
-            exp_val = int(exponent_digits) * exponent_sign
-            if base == 10:
-                # Delegate to Python's float parser to avoid precision loss
-                # from manual multiplication (e.g. 6.02 * 10**23).
-                exp_str = f"{'+' if exp_val >= 0 else ''}{exp_val}"
-                numeric_val = float(f"{sig_str}e{exp_str}") * sign
-                # Keep as int when result is a whole number with no '.'
-                if not has_dot and exp_val >= 0:
-                    int_val = int(numeric_val)
-                    if int_val == numeric_val:
-                        numeric_val = int_val
-            else:
-                # Non-decimal base: multiply by base^exponent.
-                if exp_val < 0:
-                    numeric_val = float(numeric_val) * (base**exp_val)
-                else:
-                    factor = base**exp_val
-                    numeric_val = numeric_val * factor
-                    # Keep as int if no fractional component.
-                    if isinstance(numeric_val, float) and not has_dot:
-                        int_val = int(numeric_val)
-                        if int_val == numeric_val:
-                            numeric_val = int_val
+                raise self.error(f"invalid number: {sig_str!r}")
 
         # 7. Parse optional unit suffix.
         unit = self._parse_suffix()
@@ -610,14 +551,8 @@ class _Parser:
         while True:
             ch = self.peek()
             if ch == "\\":
-                if self.peek(1) == "\n":
-                    break  # line continuation — not part of suffix
                 self.advance()  # consume '\'
-                decoded, new_pos = decode_escape(
-                    self.src, self.pos, self.line, self.current_col()
-                )
-                self.pos = new_pos
-                parts.append(decoded)
+                parts.append(self.advance_escape())
             elif is_suffix_char(ch):
                 parts.append(ch)
                 self.advance()
@@ -651,11 +586,7 @@ class _Parser:
 
             if ch == "\\":
                 self.advance()  # consume '\'
-                decoded, new_pos = decode_escape(
-                    self.src, self.pos, self.line, self.current_col()
-                )
-                self.pos = new_pos
-                parts.append(decoded)
+                parts.append(self.advance_escape())
             else:
                 parts.append(ch)
                 self.advance()
@@ -682,25 +613,11 @@ class _Parser:
         lines: list[str] = []
 
         while True:
-            if self.peek() == "":
-                raise self.error(
-                    "unexpected EOF inside raw string (missing closing quote)"
-                )
-
-            # Check for closing quote line: exactly open_col spaces then q.
-            # We peek ahead to decide.
-            closing_prefix = self.src[self.pos : self.pos + open_col + 1]
-            if closing_prefix == " " * open_col + q:
-                # Advance past the closing quote.
-                for _ in range(open_col + 1):
-                    self.advance()
-                return "\n".join(lines)
-
-            # Otherwise this is a content line — consume `indent` leading spaces.
+            # Consume `indent-1` leading spaces.
             # Empty/whitespace-only lines (fewer than indent spaces) are allowed
             # and produce an empty string in the output.
             is_empty_line = False
-            for _ in range(indent):
+            for _ in range(indent - 1):
                 if self.peek() == " ":
                     self.advance()
                 elif self.peek() == "\n":
@@ -716,17 +633,33 @@ class _Parser:
                 self.advance()  # consume '\n'
                 continue
 
-            # Collect rest of line up to (not including) '\n'.
-            line_parts: list[str] = []
-            while self.peek() not in ("\n", ""):
-                line_parts.append(self.advance())
+            # Check the first character after the indent - could be a quote, a space followed by a line, or an error
+            c = self.advance()
+            if c == q:
+                # Check for closing quote line
+                self.advance()
+                return "\n".join(lines)
+            elif c == "\n":
+                # Empty lines could also have the end of line immediately after the indent
+                lines.append("")
+                self.advance()  # consume '\n'
+            elif c == " ":
+                # Otherwise this is a content line
+                # Collect rest of line up to (not including) '\n'.
+                self.advance()  # consume ' '
 
-            lines.append("".join(line_parts))
+                line_parts: list[str] = []
+                while self.peek() not in ("\n", ""):
+                    line_parts.append(self.advance())
+
+                lines.append("".join(line_parts))
 
             if self.peek() == "\n":
                 self.advance()
-            else:
-                raise self.error("unexpected EOF inside raw string")
+            elif self.peek() == "":
+                raise self.error(
+                    "unexpected EOF inside raw string (missing closing quote)"
+                )
 
     def _parse_simple_string(self) -> str:
         """
