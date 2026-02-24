@@ -69,7 +69,16 @@ _ESCAPE_MAP: dict[str, str] = {
 # Characters that start/delimit special MOMEL values.
 _STRUCTURAL = set("()[]{}\"' \t\n")
 
-_WHITESPACE = " \t"
+_WHITESPACE = set(" \t")
+
+_SIGN_CHARS = set("+-")
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+_DEC_DIGITS = set("0123456789")
+_OCT_DIGITS = set("01234567")
+_BIN_DIGITS = set("01")
+_HEX_MARK = set("xX")
+_OCT_MARK = set("oO")
+_BIN_MARK = set("bB")
 
 
 def decode_escape(src: str, pos: int, line: int, col: int) -> tuple[str, int]:
@@ -89,21 +98,21 @@ def decode_escape(src: str, pos: int, line: int, col: int) -> tuple[str, int]:
     # \xHH
     if ch == "x":
         hex_str = src[pos + 1 : pos + 3]
-        if len(hex_str) < 2 or not all(c in "0123456789abcdefABCDEF" for c in hex_str):
+        if len(hex_str) < 2 or not all(c in _HEX_DIGITS for c in hex_str):
             raise ParseError(r"expected 2 hex digits after \x", line, col)
         return chr(int(hex_str, 16)), pos + 3
 
     # \uHHHH
     if ch == "u":
         hex_str = src[pos + 1 : pos + 5]
-        if len(hex_str) < 4 or not all(c in "0123456789abcdefABCDEF" for c in hex_str):
+        if len(hex_str) < 4 or not all(c in _HEX_DIGITS for c in hex_str):
             raise ParseError(r"expected 4 hex digits after \u", line, col)
         return chr(int(hex_str, 16)), pos + 5
 
     # \UHHHHHHHH
     if ch == "U":
         hex_str = src[pos + 1 : pos + 9]
-        if len(hex_str) < 8 or not all(c in "0123456789abcdefABCDEF" for c in hex_str):
+        if len(hex_str) < 8 or not all(c in _HEX_DIGITS for c in hex_str):
             raise ParseError(r"expected 8 hex digits after \U", line, col)
         codepoint = int(hex_str, 16)
         if codepoint > 0x10FFFF:
@@ -168,7 +177,7 @@ class _Parser:
             ch = self.src[cur_pos]
             if ch == "\n":
                 self.line += 1
-                self.line_start = cur_pos
+                self.line_start = cur_pos + 1
 
         self.pos = new_pos
         return decoded
@@ -235,16 +244,17 @@ class _Parser:
 
         while True:
             self.skip_blank_lines()
-            # Skip indentation before the field identifier or closing brace.
-            self.skip_ws_inline()
 
             ch = self.peek()
 
             # End of dict body.
-            if ch == "" and closing is not None:
-                raise self.error(f"unexpected EOF, expected {closing!r}")
-            if closing is not None and ch == closing:
-                self.advance()
+            if closing is not None:
+                if ch == "":
+                    raise self.error(f"unexpected EOF, expected {closing!r}")
+                if ch == closing:
+                    self.advance()
+                    return result
+            elif ch == "":
                 return result
 
             # Parse one field.
@@ -268,9 +278,11 @@ class _Parser:
             else:
                 result[key] = val
 
+            self.skip_comment()
+
             # Expect end of line, EOF, or closing brace.
-            if ch != "\n" and ch != "":
-                raise self.error(f"expected end of line, got {ch!r}")
+            if self.peek() != "\n" and self.peek() != "":
+                raise self.error(f"Expected end of line, got {self.peek()!r}")
 
     def _parse_identifier(self) -> str:
         """
@@ -284,17 +296,11 @@ class _Parser:
         while True:
             ch = self.peek()
 
-            if ch == "" or ch == "\n":
-                break
-
-            if ch == ":":
-                break
-
             if ch == "\\":
                 self.advance()  # consume '\'
                 parts.append(self.advance_escape())
                 numTrailingWS = 0
-            else:
+            elif is_identifier_char(ch):
                 parts.append(ch)
                 self.advance()
 
@@ -302,6 +308,8 @@ class _Parser:
                     numTrailingWS += 1
                 else:
                     numTrailingWS = 0
+            else:
+                break
 
         raw = "".join(parts)
 
@@ -420,32 +428,32 @@ class _Parser:
         exponent_str = ""
 
         # 1. Optional sign.
-        if self.peek() in "+-":
+        if self.peek() in _SIGN_CHARS:
             sig_parts.append(self.advance())
 
         # 2. Base prefix.
         base = 10
-        base_digits: str
+        base_digits: set[str]
         if self.peek() == "0":
-            if self.peek(1) in "xX":
+            if self.peek(1) in _HEX_MARK:
                 self.advance()
                 self.advance()
                 base = 16
-                base_digits = "0123456789abcdefABCDEF"
-            elif self.peek(1) in ("b", "B"):
+                base_digits = _HEX_DIGITS
+            elif self.peek(1) in _BIN_MARK:
                 self.advance()
                 self.advance()
                 base = 2
-                base_digits = "01"
-            elif self.peek(1) in ("o", "O"):
+                base_digits = _BIN_DIGITS
+            elif self.peek(1) in _OCT_MARK:
                 self.advance()
                 self.advance()
                 base = 8
-                base_digits = "01234567"
+                base_digits = _OCT_DIGITS
             else:
-                base_digits = "0123456789"
+                base_digits = _DEC_DIGITS
         else:
-            base_digits = "0123456789"
+            base_digits = _DEC_DIGITS
 
         # 3. Consume significand digits.
         #    State: we may or may not encounter a decimal point (decimal only)
@@ -463,7 +471,7 @@ class _Parser:
             elif ch == "_":
                 # Peek at what follows the underscore.
                 nxt = self.peek(1)
-                if nxt in "+-":
+                if nxt in _SIGN_CHARS:
                     # Scientific notation exponent marker.
                     self.advance()  # consume '_'
 
@@ -502,9 +510,11 @@ class _Parser:
         if not sig_str:
             raise self.error("expected digits in number")
 
-        if has_dot or (exponent_str != "" and exponent_str[0] == "-"):
+        if has_dot or exponent_str != "":
             # Float path.
-            if base == 10:
+            if base == 10 and (
+                has_dot or (exponent_str != "" and exponent_str[0] == "-")
+            ):
                 if decimals > 0:
                     py_num_str = f"{sig_str[0:-decimals]}.{sig_str[-decimals:]}"
                 else:
@@ -523,17 +533,15 @@ class _Parser:
                 except ValueError:
                     raise self.error(f"invalid number significand: {sig_str!r}")
 
-                try:
-                    exponent_val = int(exponent_str, 10)
-                except ValueError:
-                    raise self.error(f"invalid number exponent: {exponent_str!r}")
+                power_val = -decimals
+                if exponent_str != "":
+                    try:
+                        exponent_val = int(exponent_str, 10)
+                        power_val += exponent_val
+                    except ValueError:
+                        raise self.error(f"invalid number exponent: {exponent_str!r}")
 
-                power_val = exponent_val - decimals
-
-                if power_val >= 0:
-                    numeric_val = significand_val * (base**power_val)
-                else:
-                    numeric_val = significand_val / (base**power_val)
+                numeric_val = significand_val * (base**power_val)
         else:
             try:
                 numeric_val = int(sig_str, base)
@@ -606,27 +614,35 @@ class _Parser:
         """
         # Capture column before consuming the opening quote.
         open_col = self.current_col()
-        indent = open_col + 1
         q = self.advance()  # consume opening quote
         self.advance()  # consume '\n' that immediately follows
 
         lines: list[str] = []
 
         while True:
-            # Consume `indent-1` leading spaces.
+            # Consume `indent` leading spaces.
             # Empty/whitespace-only lines (fewer than indent spaces) are allowed
             # and produce an empty string in the output.
             is_empty_line = False
-            for _ in range(indent - 1):
+            for _ in range(open_col):
                 if self.peek() == " ":
                     self.advance()
                 elif self.peek() == "\n":
                     is_empty_line = True
                     break
+                elif self.peek() == "":
+                    raise self.error(
+                        f"Unexpected EOF inside raw string (before content line or closing quote)"
+                    )
                 else:
                     raise self.error(
-                        f"raw string content line must be indented by {indent} spaces"
+                        f"raw string content line must be indented by {open_col+1} spaces"
                     )
+
+            if self.peek() == "":
+                raise self.error(
+                    f"Unexpected EOF inside raw string (before content line or closing quote)"
+                )
 
             if is_empty_line:
                 lines.append("")
@@ -636,30 +652,26 @@ class _Parser:
             # Check the first character after the indent - could be a quote, a space followed by a line, or an error
             c = self.advance()
             if c == q:
-                # Check for closing quote line
-                self.advance()
+                # Closing quote line
                 return "\n".join(lines)
             elif c == "\n":
                 # Empty lines could also have the end of line immediately after the indent
                 lines.append("")
-                self.advance()  # consume '\n'
             elif c == " ":
                 # Otherwise this is a content line
                 # Collect rest of line up to (not including) '\n'.
-                self.advance()  # consume ' '
-
                 line_parts: list[str] = []
-                while self.peek() not in ("\n", ""):
-                    line_parts.append(self.advance())
-
-                lines.append("".join(line_parts))
-
-            if self.peek() == "\n":
-                self.advance()
-            elif self.peek() == "":
-                raise self.error(
-                    "unexpected EOF inside raw string (missing closing quote)"
-                )
+                while True:
+                    if self.peek() == "\n":
+                        lines.append("".join(line_parts))
+                        self.advance()
+                        break
+                    elif self.peek() == "":
+                        raise self.error(
+                            "unexpected EOF inside raw string (missing closing quote)"
+                        )
+                    else:
+                        line_parts.append(self.advance())
 
     def _parse_simple_string(self) -> str:
         """
