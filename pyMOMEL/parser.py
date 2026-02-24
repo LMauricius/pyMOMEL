@@ -76,9 +76,25 @@ _HEX_DIGITS = set("0123456789abcdefABCDEF")
 _DEC_DIGITS = set("0123456789")
 _OCT_DIGITS = set("01234567")
 _BIN_DIGITS = set("01")
-_HEX_MARK = set("xX")
-_OCT_MARK = set("oO")
-_BIN_MARK = set("bB")
+_BASE_PREFIX = {
+    "x": (16, _HEX_DIGITS), "X": (16, _HEX_DIGITS),
+    "b": (2, _BIN_DIGITS),  "B": (2, _BIN_DIGITS),
+    "o": (8, _OCT_DIGITS),  "O": (8, _OCT_DIGITS),
+}
+
+
+_HEX_ESC_LEN = {"x": 2, "u": 4, "U": 8}
+
+
+def _hex_esc(src: str, pos: int, count: int, ch: str, line: int, col: int) -> tuple[str, int]:
+    """Parse \\xHH, \\uHHHH, or \\UHHHHHHHH escape at src[pos] (on the escape letter)."""
+    h = src[pos + 1 : pos + 1 + count]
+    if len(h) < count or not all(c in _HEX_DIGITS for c in h):
+        raise ParseError(rf"expected {count} hex digits after \{ch}", line, col)
+    cp = int(h, 16)
+    if cp > 0x10FFFF:
+        raise ParseError(f"Unicode codepoint {cp:#x} out of range", line, col)
+    return chr(cp), pos + 1 + count
 
 
 def decode_escape(src: str, pos: int, line: int, col: int) -> tuple[str, int]:
@@ -95,43 +111,11 @@ def decode_escape(src: str, pos: int, line: int, col: int) -> tuple[str, int]:
     if ch in _ESCAPE_MAP:
         return _ESCAPE_MAP[ch], pos + 1
 
-    # \xHH
-    if ch == "x":
-        hex_str = src[pos + 1 : pos + 3]
-        if len(hex_str) < 2 or not all(c in _HEX_DIGITS for c in hex_str):
-            raise ParseError(r"expected 2 hex digits after \x", line, col)
-        return chr(int(hex_str, 16)), pos + 3
-
-    # \uHHHH
-    if ch == "u":
-        hex_str = src[pos + 1 : pos + 5]
-        if len(hex_str) < 4 or not all(c in _HEX_DIGITS for c in hex_str):
-            raise ParseError(r"expected 4 hex digits after \u", line, col)
-        return chr(int(hex_str, 16)), pos + 5
-
-    # \UHHHHHHHH
-    if ch == "U":
-        hex_str = src[pos + 1 : pos + 9]
-        if len(hex_str) < 8 or not all(c in _HEX_DIGITS for c in hex_str):
-            raise ParseError(r"expected 8 hex digits after \U", line, col)
-        codepoint = int(hex_str, 16)
-        if codepoint > 0x10FFFF:
-            raise ParseError(
-                f"Unicode codepoint {codepoint:#x} out of range", line, col
-            )
-        return chr(codepoint), pos + 9
+    if ch in _HEX_ESC_LEN:
+        return _hex_esc(src, pos, _HEX_ESC_LEN[ch], ch, line, col)
 
     raise ParseError(f"unknown escape sequence: \\{ch}", line, col)
 
-
-def is_suffix_char(ch: str) -> bool:
-    """True if ch may appear unescaped in a number suffix or simple string."""
-    return ch not in _STRUCTURAL and ch != ""
-
-
-def is_identifier_char(ch: str) -> bool:
-    """True if ch may appear unescaped in a dict key (not ':' and not newline)."""
-    return ch != ":" and ch != "\n" and ch != ""
 
 
 # ---------------------------------------------------------------------------
@@ -217,12 +201,9 @@ class _Parser:
             self.skip_ws_inline()
             self.skip_comment()
 
-            if self.peek() == "\n":
-                self.advance()  # consume the newline and keep going
-            elif self.peek() == "":
-                break  # EOF is fine
-            else:
+            if self.peek() != "\n":
                 break
+            self.advance()
 
     # ------------------------------------------------------------------
     # Top-level / dict
@@ -266,12 +247,7 @@ class _Parser:
             # Duplicate key handling: merge if both sides are (dict,).
             if key in result:
                 old_val = result[key]
-                if (
-                    len(old_val) == 1
-                    and isinstance(old_val[0], dict)
-                    and len(val) == 1
-                    and isinstance(val[0], dict)
-                ):
+                if _is_dict_tuple(old_val) and _is_dict_tuple(val):
                     result[key] = (_merge_dicts(old_val[0], val[0]),)
                 else:
                     raise self.error(f"duplicate key {key!r}")
@@ -300,7 +276,7 @@ class _Parser:
                 self.advance()  # consume '\'
                 parts.append(self.advance_escape())
                 numTrailingWS = 0
-            elif is_identifier_char(ch):
+            elif ch != ":" and ch != "\n" and ch != "":
                 parts.append(ch)
                 self.advance()
 
@@ -407,7 +383,7 @@ class _Parser:
 
         # Simple string / keyword.
         if ch not in _STRUCTURAL and ch != "":
-            return self._parse_simple_string()
+            return self._parse_suffix()
 
         raise self.error(f"unexpected character {ch!r} in value position")
 
@@ -432,28 +408,13 @@ class _Parser:
             sig_parts.append(self.advance())
 
         # 2. Base prefix.
-        base = 10
-        base_digits: set[str]
+        base, base_digits = 10, _DEC_DIGITS
         if self.peek() == "0":
-            if self.peek(1) in _HEX_MARK:
+            pfx = _BASE_PREFIX.get(self.peek(1))
+            if pfx:
                 self.advance()
                 self.advance()
-                base = 16
-                base_digits = _HEX_DIGITS
-            elif self.peek(1) in _BIN_MARK:
-                self.advance()
-                self.advance()
-                base = 2
-                base_digits = _BIN_DIGITS
-            elif self.peek(1) in _OCT_MARK:
-                self.advance()
-                self.advance()
-                base = 8
-                base_digits = _OCT_DIGITS
-            else:
-                base_digits = _DEC_DIGITS
-        else:
-            base_digits = _DEC_DIGITS
+                base, base_digits = pfx
 
         # 3. Consume significand digits.
         #    State: we may or may not encounter a decimal point (decimal only)
@@ -561,7 +522,7 @@ class _Parser:
             if ch == "\\":
                 self.advance()  # consume '\'
                 parts.append(self.advance_escape())
-            elif is_suffix_char(ch):
+            elif ch not in _STRUCTURAL and ch != "":
                 parts.append(ch)
                 self.advance()
             else:
@@ -673,18 +634,15 @@ class _Parser:
                     else:
                         line_parts.append(self.advance())
 
-    def _parse_simple_string(self) -> str:
-        """
-        Parse a simple (unquoted) string / keyword.
-        Same character class as number suffixes.
-        Starts with a non-digit (enforced by caller via dispatch).
-        """
-        return self._parse_suffix()
-
 
 # ---------------------------------------------------------------------------
 # Dict merge utility
 # ---------------------------------------------------------------------------
+
+
+def _is_dict_tuple(v: tuple) -> bool:
+    """True if v is a single-element tuple containing a dict."""
+    return len(v) == 1 and isinstance(v[0], dict)
 
 
 def _merge_dicts(a: dict, b: dict) -> dict:
@@ -697,12 +655,7 @@ def _merge_dicts(a: dict, b: dict) -> dict:
     for key, b_val in b.items():
         if key in result:
             a_val = result[key]
-            if (
-                len(a_val) == 1
-                and isinstance(a_val[0], dict)
-                and len(b_val) == 1
-                and isinstance(b_val[0], dict)
-            ):
+            if _is_dict_tuple(a_val) and _is_dict_tuple(b_val):
                 result[key] = (_merge_dicts(a_val[0], b_val[0]),)
             else:
                 raise ParseError(f"duplicate key {key!r} in merged dicts", 0, 0)
