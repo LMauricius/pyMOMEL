@@ -70,7 +70,7 @@ def is_simple(val):
 
 
 TESTS = [
-    """
+    R"""
 # This file contains some data...
 # Edit it as needed!
 
@@ -121,14 +121,106 @@ Today's mentioned trivia: {
     Most remote inhabited archipelago: "Tristan da Cunha"
 }
 """,
+    R"""
+# This is a comment: the value describes the last achieved score
+Score: 300
+""",
+    R"""
+Today's mentioned trivia: {
+    Mass of Earth: 5.97219_+24kg
+    Tallest statue: "Statue of Unity"
+    Most remote inhabited archipelago: "Tristan da Cunha"
+}
+""",
+    R"""
+User: {
+    Name: "John"
+    Score: 300
+    Status: {
+        Attempts: 3
+    }
+}
+User: {
+    Quote: "I'm the best!"
+    Status: {
+        Playtime: 5h 47min
+    }
+}
+""",
+    R"""
+User: {
+    Name: "John"
+    Score: 300
+    Quote: "I'm the best!"
+    Status: {
+        Attempts: 3
+        Playtime: 5h 47min
+    }
+}
+""",
+    R"""
+Scores: [
+    9.8
+    8.5
+    9.1
+]
+""",
+    R"""
+Long number: 1_000_000
+""",
+    R"""
+Number in scientific notation: 6.02_+23
+""",
+    R"""
+Binary sequence: 0b10_1100_0101
+""",
+    R"""
+Big binary: 0b1_+9 # Equal to 0b10_0000_0000
+""",
+    R"""
+Weight: 75kg
+Distance: 5km
+""",
+    R"""
+Name: "John Smith"
+""",
+    R"""
+Line: "John said \"Hello world!\""
+""",
+    R"""
+Blood type: AB+
+""",
+    R"""
+Comment: "
+          Enjoyed the scenic route.
+          Planning to bring friends next time.
+         "
+""",
+    R"""
+Comment: \
+    "
+     Enjoyed the scenic route.
+     Planning to bring friends next time.
+    "
+""",
+    R"""
+Favourite color: rgb 240 98 146
+""",
+    R"""
+I'm a multiline tuple: 1 two \
+    3.0 0b1_+2 "five"
+""",
+    R"""
+""",
 ]
 
 for testStr in TESTS:
+    print("==========================================================================")
     print("==== TEST ================================================================")
-    print(testStr)
+    print(testStr.strip())
     print("--------------------------------------------------------------------------")
     try:
         res = pyMOMEL.parse(testStr)
-        print(pprint(res, True))
+        print(pprint(res, True).strip())
     except Exception as e:
         print(repr(e))
